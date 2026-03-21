@@ -1,0 +1,3 @@
+httpx
+notion-client
+python-dotenv

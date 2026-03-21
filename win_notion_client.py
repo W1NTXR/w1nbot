@@ -1,72 +1,168 @@
-# notion_client.py
+from __future__ import annotations
 
-import os
+import json
+from dataclasses import dataclass
 from datetime import date
 
-from dotenv import load_dotenv
 from notion_client import Client
-import json
 
-load_dotenv()
-
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-NOTION_DATA_SOURCE_ID = os.getenv("NOTION_DATA_SOURCE_ID") or NOTION_DATABASE_ID
-notion = Client(auth=NOTION_API_KEY)
+from config import AppConfig, load_config
+from utils import parse_iso_date
 
 
-def _read_plain_text(property_value):
+def _read_plain_text(items):
+    if not items:
+        return ""
+    x = "".join(item.get("plain_text", "") for item in items)
+    return x
+
+
+def _read_select_name(property_value):
     if not property_value:
         return ""
-    return "".join(item.get("plain_text", "") for item in property_value)
+    x = property_value.get("name", "")
+    return x
 
 
-def _priority_sort_value(priority_name):
-    priority_order = {"P0": 0, "P1": 1, "P2": 2}
-    return priority_order.get(priority_name, 99)
+def _read_status_name(property_value):
+    if not property_value:
+        return ""
+    x = property_value.get("status", {}).get("name", "")
+    return x
+
+
+def _priority_rank(priority_name: str) -> int:
+    order = {"P0": 0, "P1": 1, "P2": 2, "High": 3, "Medium": 4, "Low": 5}
+    return order.get(priority_name, 99)
+
+
+@dataclass(slots=True)
+class NotionTask:
+    id: str
+    title: str
+    notes: str
+    priority: str
+    due_date: str
+    status: str
+    url: str
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "notes": self.notes,
+            "priority": self.priority,
+            "due_date": self.due_date,
+            "status": self.status,
+            "url": self.url,
+        }
+
+
+class NotionWorkflowClient:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.client = Client(auth=config.notion_api_key)
+        self.review_status = config.notion_review_status
+
+    def fetch_actionable_tasks(self, today: date | None = None) -> list[dict]:
+        current_date = today or date.today()
+        results = self._query_results()
+        print(len(results))
+        tasks: list[NotionTask] = []
+        for item in results:
+            task = self._parse_task(item)
+            if not task.title:
+                continue
+            if not self._is_actionable(task, current_date):
+                continue
+            tasks.append(task)
+
+        tasks.sort(
+            key=lambda task: (
+                task.due_date or "9999-12-31",
+                _priority_rank(task.priority),
+                task.title.lower(),
+            )
+        )
+        print(len(tasks))
+        return [task.to_dict() for task in tasks]
+
+    def update_task_status(self, page_id: str, status: str) -> None:
+        try:
+            self.client.pages.update(
+                page_id=page_id,
+                properties={
+                    self.config.notion_status_property: {
+                        "status": {"name": status}
+                    }
+                },
+            )
+        except Exception:
+            self.client.pages.update(
+                page_id=page_id,
+                properties={
+                    self.config.notion_status_property: {
+                        "select": {"name": status}
+                    }
+                },
+            )
+
+    def _query_results(self) -> list[dict]:
+        results: list[dict] = []
+        query_kwargs = {"page_size": 100}
+        cursor = None
+
+
+        if self.config.notion_data_source_id:
+            response = self.client.data_sources.query(
+                data_source_id=self.config.notion_data_source_id
+            )
+        
+        else:
+            response = self.client.databases.query(
+                database_id=self.config.notion_database_id
+            )
+        
+        results.extend(response.get("results", []))
+        print(len(results))
+        return  results
+
+    def _parse_task(self, page: dict) -> NotionTask:
+        
+        properties = page.get("properties", {})
+        title_prop = properties.get(self.config.notion_title_property, {})
+        notes_prop = properties.get(self.config.notion_notes_property, {})
+        priority_prop = properties.get(self.config.notion_priority_property, {})
+        due_date_prop = properties.get(self.config.notion_due_date_property, {})
+        status_prop = properties.get(self.config.notion_status_property, {})
+
+        return NotionTask(
+            id=page["id"],
+            title=_read_plain_text(title_prop.get("title", [])),
+            notes=_read_plain_text(notes_prop.get("rich_text", [])),
+            priority=_read_select_name(priority_prop.get("select", {})),
+            due_date=due_date_prop.get("date", {}).get("start", "") or "",
+            status=_read_status_name(status_prop) or _read_select_name(status_prop.get("select", {})),
+            url=page.get("url", ""),
+        )
+
+    def _is_actionable(self, task: NotionTask, current_date: date) -> bool:
+        if task.status and task.status.lower() not in {
+            status.lower() for status in self.config.actionable_statuses
+        }:
+            return False
+        due = parse_iso_date(task.due_date)
+        return due is None or due <= current_date
 
 
 def get_today_tasks():
-    if not NOTION_API_KEY:
-        raise ValueError("Missing NOTION_API_KEY in environment.")
-    if not NOTION_DATA_SOURCE_ID:
-        raise ValueError(
-            "Missing NOTION_DATA_SOURCE_ID in environment."
-            " If you only have a database ID, fetch the data source ID from Notion first."
-        )
-
-    today = date.today().isoformat()
-
-    response = notion.data_sources.query(
-        data_source_id=NOTION_DATA_SOURCE_ID,
-        filter={
-            "and": [
-                {"property": "Due Date", "date": {"before": today}},
-            ]
-        }
-    )
-    tasks_dict = response["results"]
-    tasks = []
-    for task in tasks_dict:
-        properties = task.get("properties", {})
-        t_title = _read_plain_text(properties.get("Task", {}).get("title", []))
-        t_notes = _read_plain_text(properties.get("Notes", {}).get("rich_text", []))
-        t_priority = properties.get("Priority", {}).get("select", {}).get("name", "")
-        t_date = properties.get("Due Date", {}).get("date", {}).get("start", "")
-        tasks.append({
-            "title": t_title,
-            "notes": t_notes,
-            "priority": t_priority,
-            "due_date": t_date,
-        })
-
-    tasks.sort(key=lambda task: (task["due_date"] or "9999-12-31", _priority_sort_value(task["priority"])))
-    return tasks
+    client = NotionWorkflowClient(load_config())
+    return client.fetch_actionable_tasks()
 
 
 def main():
-    tasks = get_today_tasks()
-    print(json.dumps(tasks, indent = 2))
+    print(type(get_today_tasks()))
+    json.dumps(get_today_tasks(), indent=2)
 
 
 if __name__ == "__main__":
