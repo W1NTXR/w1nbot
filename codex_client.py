@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
+from pathlib import Path
 from textwrap import dedent
 
 
@@ -102,18 +104,31 @@ class CodexClient:
     def _run(self, messages: list[dict], command: str | None) -> str:
         if command:
             payload = json.dumps(messages)
-            result = subprocess.run(
-                command,
-                input=payload,
-                text=True,
-                capture_output=True,
-                shell=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                stderr = result.stderr.strip() or "Unknown Codex command error."
-                raise RuntimeError(stderr)
-            return result.stdout.strip()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as output_file:
+                output_path = Path(output_file.name)
+            try:
+                result = subprocess.run(
+                    f'{command} -o "{output_path}"',
+                    input=payload,
+                    text=True,
+                    capture_output=True,
+                    shell=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.strip() or "Unknown Codex command error."
+                    raise RuntimeError(stderr)
+
+                response = output_path.read_text(encoding="utf-8").strip()
+                if response:
+                    return response
+
+                stdout = result.stdout.strip()
+                if stdout:
+                    return stdout
+                raise RuntimeError("Codex command returned no response.")
+            finally:
+                output_path.unlink(missing_ok=True)
         return call_codex(messages)
 
 

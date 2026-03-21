@@ -3,3 +3,5 @@ __pycache__/
 */__pycache__/
 memory/*.json
 reports/
+memory/__pycache__
+*.pyc
