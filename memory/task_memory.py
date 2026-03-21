@@ -1,24 +1,41 @@
-import json
-import os
+from __future__ import annotations
 
-MEMORY_DIR = "memory"
+from pathlib import Path
 
-os.makedirs(MEMORY_DIR, exist_ok = True)
+from utils import read_json, utc_now_iso, write_json
 
-def get_memory_path(task_id):
-    return os.path.join(MEMORY_DIR,f"{task_id}.json")
 
-def load_memory(task_id):
-    path = get_memory_path(task_id)
+class TaskMemoryStore:
+    def __init__(self, memory_dir: Path) -> None:
+        self.memory_dir = memory_dir
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
 
-    if not os.path.exists(path):
-        return []
+    def get_memory_path(self, task_id: str) -> Path:
+        return self.memory_dir / f"{task_id}.json"
 
-    with open(path,"r") as f:
-        return json.load(f)
+    def load(self, task_id: str, task_snapshot: dict | None = None) -> dict:
+        payload = read_json(
+            self.get_memory_path(task_id),
+            {
+                "task": task_snapshot or {},
+                "workflow_state": "discussing",
+                "discussion": [],
+                "planning_summary": "",
+                "reports": [],
+                "drive_file": None,
+                "execution": None,
+                "updated_at": utc_now_iso(),
+            },
+        )
+        if task_snapshot:
+            payload["task"] = task_snapshot
+        return payload
 
-def save_memory(task_id, history):
-    path = get_memory_path(task_id)
+    def save(self, task_id: str, payload: dict) -> dict:
+        payload["updated_at"] = utc_now_iso()
+        write_json(self.get_memory_path(task_id), payload)
+        return payload
 
-    with open(path, "w") as f:
-        json.dump(history, f, indent=2)
+    def append_message(self, task_id: str, payload: dict, role: str, content: str) -> dict:
+        payload["discussion"].append({"role": role, "content": content, "at": utc_now_iso()})
+        return self.save(task_id, payload)
