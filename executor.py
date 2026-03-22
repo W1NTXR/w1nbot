@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from textwrap import dedent
 
 from utils import utc_now_iso
@@ -27,6 +28,8 @@ class DiscussionExecutor:
     def run_task(self, task: dict) -> dict:
         project_memory = self.project_memory_store.load()
         task_memory = self.task_memory_store.load(task["id"], task)
+        session = self._start_session(task)
+        awaiting_abort_confirmation = False
 
         if not task_memory["discussion"]:
             self.telegram.send_message(self._task_intro(task, task_memory))
@@ -38,7 +41,22 @@ class DiscussionExecutor:
             message_text = self.telegram.wait_for_command_or_message()
             command = message_text.strip().lower()
 
+            if awaiting_abort_confirmation:
+                if command in {"/confirm abort", "confirm abort", "yes", "y"}:
+                    return self._abort_session(task, session)
+                awaiting_abort_confirmation = False
+                self.telegram.send_message("Kill switch cancelled. Session is still active.")
+                continue
+
+            if command in {"/abort", "/kill", "/killswitch"}:
+                awaiting_abort_confirmation = True
+                self.telegram.send_message(
+                    "Kill switch is armed. Reply with `/confirm abort` to erase this session and exit, or send any other message to cancel."
+                )
+                continue
+
             if command in {"end discussion", "/done"}:
+                self._snapshot_report(task, "plan", session)
                 plan_report = self.codex.generate_plan_report(task, project_memory, task_memory)
                 plan_path = self.reporter.save_report(task, plan_report, "plan")
                 task_memory["planning_summary"] = plan_report
@@ -54,6 +72,7 @@ class DiscussionExecutor:
                         }
                     )
                     task_memory["drive_file"] = drive_meta
+                    self._track_drive_file(drive_meta, session)
                     self.task_memory_store.save(task["id"], task_memory)
                     self.telegram.send_message(
                         self.reporter.telegram_summary(
@@ -95,7 +114,7 @@ class DiscussionExecutor:
                         "Implementation is blocked until discussion is ended and the plan is generated."
                     )
                     continue
-                return self._execute(task, project_memory, task_memory)
+                return self._execute(task, project_memory, task_memory, session)
 
             if task_memory["workflow_state"] == "planned_waiting_approval":
                 task_memory["workflow_state"] = "discussing"
@@ -115,7 +134,13 @@ class DiscussionExecutor:
             )
             self.telegram.send_message(reply)
 
-    def _execute(self, task: dict, project_memory: dict, task_memory: dict) -> dict:
+    def _execute(
+        self,
+        task: dict,
+        project_memory: dict,
+        task_memory: dict,
+        session: dict,
+    ) -> dict:
         task_memory["workflow_state"] = "executing"
         task_memory["execution"] = {"started_at": utc_now_iso()}
         self.task_memory_store.save(task["id"], task_memory)
@@ -130,6 +155,7 @@ class DiscussionExecutor:
             task_memory,
             execution_output,
         )
+        self._snapshot_report(task, "final", session)
         final_path = self.reporter.save_report(task, final_report, "final")
 
         try:
@@ -141,6 +167,7 @@ class DiscussionExecutor:
                 )
             else:
                 drive_meta = self.drive_store.upload_report(final_path)
+                self._track_drive_file(drive_meta, session)
         except Exception as exc:
             task_memory["workflow_state"] = "delivery_failed"
             task_memory["execution"]["delivery_error"] = str(exc)
@@ -178,6 +205,58 @@ class DiscussionExecutor:
         )
         return task_memory
 
+    def _start_session(self, task: dict) -> dict:
+        return {
+            "task_id": task["id"],
+            "memory_snapshot": self.task_memory_store.snapshot(task["id"]),
+            "report_snapshots": {},
+            "created_drive_file_ids": set(),
+        }
+
+    def _snapshot_report(self, task: dict, stage: str, session: dict) -> Path:
+        path = self.reporter.get_report_path(task, stage)
+        key = str(path)
+        if key in session["report_snapshots"]:
+            return path
+
+        if path.exists():
+            session["report_snapshots"][key] = {
+                "exists": True,
+                "content": path.read_text(encoding="utf-8"),
+            }
+        else:
+            session["report_snapshots"][key] = {"exists": False, "content": ""}
+        return path
+
+    def _track_drive_file(self, drive_meta: dict | None, session: dict) -> None:
+        if not drive_meta:
+            return
+        file_id = drive_meta.get("id")
+        if file_id:
+            session["created_drive_file_ids"].add(file_id)
+
+    def _abort_session(self, task: dict, session: dict) -> dict:
+        for file_id in session["created_drive_file_ids"]:
+            try:
+                self.drive_store.delete_report(file_id)
+            except Exception as exc:
+                self.telegram.send_message(
+                    f"Kill switch removed local session state, but failed to delete Google Drive file {file_id}: {exc}"
+                )
+
+        for path_str, snapshot in session["report_snapshots"].items():
+            path = Path(path_str)
+            if snapshot.get("exists"):
+                path.write_text(snapshot.get("content", ""), encoding="utf-8")
+            else:
+                path.unlink(missing_ok=True)
+
+        self.task_memory_store.restore_snapshot(task["id"], session["memory_snapshot"])
+        self.telegram.send_message(
+            "Session aborted. Current-session memory and report artifacts were removed, and no new state was kept."
+        )
+        return {"workflow_state": "aborted"}
+
     def _task_intro(self, task: dict, task_memory: dict) -> str:
         previous_summary = task_memory.get("planning_summary") or "None"
         return dedent(
@@ -198,5 +277,6 @@ class DiscussionExecutor:
             Use `end discussion` or `/done` to close planning.
             Use `/implement` or `/approve` after planning to start execution.
             Use `/skip` to defer this task.
+            Use `/abort` to erase this active session after confirmation.
             """
         ).strip()

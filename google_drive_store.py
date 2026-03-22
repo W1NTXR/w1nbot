@@ -65,3 +65,15 @@ class GoogleDriveReportStore:
             )
             details.raise_for_status()
             return details.json()
+
+    def delete_report(self, file_id: str) -> None:
+        if not self.access_token:
+            raise RuntimeError("Missing GOOGLE_DRIVE_ACCESS_TOKEN.")
+
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        with httpx.Client(timeout=60.0) as client:
+            response = client.delete(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                headers=headers,
+            )
+            response.raise_for_status()

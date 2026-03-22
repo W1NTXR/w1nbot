@@ -10,9 +10,12 @@ class Reporter:
         self.reports_dir = reports_dir
         self.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_report(self, task: dict, report_body: str, stage: str) -> Path:
+    def get_report_path(self, task: dict, stage: str) -> Path:
         filename = f"{task['id']}-{stage}-{slugify(task['title'])}.md"
-        path = self.reports_dir / filename
+        return self.reports_dir / filename
+
+    def save_report(self, task: dict, report_body: str, stage: str) -> Path:
+        path = self.get_report_path(task, stage)
         path.write_text(report_body, encoding="utf-8")
         return path
 
