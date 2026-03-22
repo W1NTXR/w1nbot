@@ -15,6 +15,7 @@ def _csv_list(value: str | None, default: list[str]) -> list[str]:
 
 @dataclass(slots=True)
 class AppConfig:
+    target_repo_path: Path
     notion_api_key: str
     notion_database_id: str | None
     notion_data_source_id: str | None
@@ -41,8 +42,10 @@ class AppConfig:
 def load_config() -> AppConfig:
     load_dotenv()
 
+    target_repo_path = Path(os.getenv("TARGET_REPO_PATH", os.getcwd())).expanduser()
     memory_dir = Path(os.getenv("MEMORY_DIR", "memory"))
     config = AppConfig(
+        target_repo_path=target_repo_path,
         notion_api_key=os.getenv("NOTION_API_KEY", ""),
         notion_database_id=os.getenv("NOTION_DATABASE_ID"),
         notion_data_source_id=os.getenv("NOTION_DATA_SOURCE_ID"),
@@ -75,6 +78,14 @@ def load_config() -> AppConfig:
         raise ValueError("Missing NOTION_API_KEY in environment.")
     if not (config.notion_data_source_id or config.notion_database_id):
         raise ValueError("Missing NOTION_DATA_SOURCE_ID or NOTION_DATABASE_ID.")
+    if not config.target_repo_path.exists():
+        raise ValueError(
+            f"Configured TARGET_REPO_PATH does not exist: {config.target_repo_path}"
+        )
+    if not config.target_repo_path.is_dir():
+        raise ValueError(
+            f"Configured TARGET_REPO_PATH is not a directory: {config.target_repo_path}"
+        )
 
     config.memory_dir.mkdir(parents=True, exist_ok=True)
     config.reports_dir.mkdir(parents=True, exist_ok=True)

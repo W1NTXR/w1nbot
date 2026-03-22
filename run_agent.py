@@ -29,15 +29,11 @@ def main() -> None:
         config.google_drive_folder_id,
     )
     codex_client = CodexClient(
+        target_repo_path=config.target_repo_path,
         discussion_command=config.codex_discussion_command,
         report_command=config.codex_report_command,
         execution_command=config.codex_execution_command,
     )
-
-    tasks = notion_client.fetch_actionable_tasks()
-    if not tasks:
-        print("No actionable tasks found.")
-        return
 
     executor = DiscussionExecutor(
         telegram_client=telegram_client,
@@ -48,7 +44,7 @@ def main() -> None:
         drive_store=drive_store,
         codex_client=codex_client,
     )
-    executor.run_task(tasks[0])
+    executor.run()
 
 
 if __name__ == "__main__":
