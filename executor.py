@@ -1,9 +1,10 @@
 from __future__ import annotations
+from datetime import date
 from pathlib import Path
 from textwrap import dedent
 
 from git_workflow import GitWorkflow
-from utils import utc_now_iso
+from utils import parse_iso_date, utc_now_iso
 
 
 class DiscussionExecutor:
@@ -31,6 +32,7 @@ class DiscussionExecutor:
         task_memory: dict | None = None
         session: dict | None = None
         pending_task: dict | None = None
+        task_browser: dict | None = None
         init_state: dict | None = None
         report_state: dict | None = None
         awaiting_abort_confirmation = False
@@ -62,19 +64,38 @@ class DiscussionExecutor:
 
             if pending_task:
                 if command in {"/confirm start", "confirm start", "yes", "y"}:
-                    active_task = pending_task
-                    pending_task = None
-                    project_name = self._require_project_name(project_memory)
-                    task_memory = self.task_memory_store.load(project_name, active_task["id"], active_task)
-                    session = self._start_session(project_name, active_task)
-                    task_memory["workflow_state"] = "discussing"
-                    self.task_memory_store.save(project_name, active_task["id"], task_memory)
-                    self.telegram.send_message(
-                        self._task_intro(active_task, task_memory, project_memory)
+                    active_task, task_memory, session = self._begin_task(
+                        project_memory,
+                        pending_task,
                     )
+                    pending_task = None
+                    task_browser = None
+                    continue
+                if command in {"no", "n"} and task_browser:
+                    pending_task = None
+                    self.telegram.send_message(self._task_browser_message(project_memory, task_browser))
                     continue
                 pending_task = None
+                if task_browser:
+                    self.telegram.send_message(self._task_browser_message(project_memory, task_browser))
+                    continue
                 self.telegram.send_message("Task start cancelled.")
+                continue
+
+            if task_browser:
+                selection = self._handle_task_browser_input(
+                    message_text,
+                    task_browser,
+                )
+                if selection["action"] == "pick":
+                    pending_task = selection["task"]
+                    self.telegram.send_message(self._task_confirmation(project_memory, pending_task))
+                    continue
+                if selection["action"] == "browse":
+                    self.telegram.send_message(self._task_browser_message(project_memory, task_browser))
+                    continue
+                task_browser = None
+                self.telegram.send_message("Task selection cancelled.")
                 continue
 
             if awaiting_abort_confirmation:
@@ -111,8 +132,13 @@ class DiscussionExecutor:
                 if not tasks:
                     self.telegram.send_message("No actionable tasks found.")
                     continue
-                pending_task = tasks[0]
-                self.telegram.send_message(self._task_confirmation(project_memory, pending_task))
+                task_browser = self._create_task_browser(tasks, date.today())
+                if not task_browser:
+                    self.telegram.send_message(
+                        "No tasks are due today or earlier outside `In Review` and `Done`."
+                    )
+                    continue
+                self.telegram.send_message(self._task_browser_message(project_memory, task_browser))
                 continue
 
             if command in {"/abort", "/kill", "/killswitch"}:
@@ -191,6 +217,21 @@ class DiscussionExecutor:
                 reply,
             )
             self.telegram.send_message(reply)
+
+    def _begin_task(
+        self,
+        project_memory: dict,
+        task: dict,
+    ) -> tuple[dict, dict, dict]:
+        project_name = self._require_project_name(project_memory)
+        task_memory = self.task_memory_store.load(project_name, task["id"], task)
+        session = self._start_session(project_name, task)
+        task_memory["workflow_state"] = "discussing"
+        self.task_memory_store.save(project_name, task["id"], task_memory)
+        self.telegram.send_message(
+            self._task_intro(task, task_memory, project_memory)
+        )
+        return task, task_memory, session
 
     def _implement(
         self,
@@ -449,7 +490,7 @@ class DiscussionExecutor:
     def _task_confirmation(self, project_memory: dict, task: dict) -> str:
         return dedent(
             f"""
-            Proposed task for project `{project_memory.get("project_name")}`:
+            Selected task for project `{project_memory.get("project_name")}`:
             Title: {task["title"]}
             Status: {task.get("status") or "Unspecified"}
             Due: {task.get("due_date") or "Unspecified"}
@@ -458,7 +499,8 @@ class DiscussionExecutor:
             Notes:
             {task.get("notes") or "No notes available."}
 
-            Reply with `/confirm start` to begin this task, or anything else to cancel.
+            Reply with `yes` or `/confirm start` to begin this task.
+            Reply with `no` to return to the task list.
             """
         ).strip()
 
@@ -530,6 +572,90 @@ class DiscussionExecutor:
             /abort
             """
         ).strip()
+
+    def _create_task_browser(self, tasks: list[dict], current_date: date) -> dict | None:
+        eligible_tasks = []
+        for task in tasks:
+            due = parse_iso_date(task.get("due_date"))
+            status = (task.get("status") or "").strip().lower()
+            if due is None or due > current_date:
+                continue
+            if status in {"in review", "done"}:
+                continue
+            eligible_tasks.append(task)
+
+        if not eligible_tasks:
+            return None
+
+        groups: list[dict] = []
+        for task in eligible_tasks:
+            due_value = task.get("due_date") or ""
+            if groups and groups[-1]["due_date"] == due_value:
+                groups[-1]["tasks"].append(task)
+                continue
+            groups.append({"due_date": due_value, "tasks": [task]})
+
+        return {"groups": groups, "index": 0}
+
+    def _handle_task_browser_input(self, message_text: str, task_browser: dict) -> dict:
+        command = message_text.strip().lower()
+        groups = task_browser["groups"]
+        index = task_browser["index"]
+        current_group = groups[index]
+
+        if command in {"cancel", "/cancel"}:
+            return {"action": "cancel"}
+        if command in {"next", "n"}:
+            if index < len(groups) - 1:
+                task_browser["index"] = index + 1
+            return {"action": "browse"}
+        if command in {"back", "prev", "previous", "b"}:
+            if index > 0:
+                task_browser["index"] = index - 1
+            return {"action": "browse"}
+        if command.isdigit():
+            choice = int(command)
+            if 1 <= choice <= len(current_group["tasks"]):
+                return {"action": "pick", "task": current_group["tasks"][choice - 1]}
+        return {"action": "browse"}
+
+    def _task_browser_message(self, project_memory: dict, task_browser: dict) -> str:
+        groups = task_browser["groups"]
+        index = task_browser["index"]
+        current_group = groups[index]
+        due_label = self._format_due_date(current_group["due_date"])
+
+        lines = [
+            f'Tasks for project `{project_memory.get("project_name")}`',
+            f'Showing {len(current_group["tasks"])} task(s) due on {due_label}.',
+            "",
+        ]
+        for position, task in enumerate(current_group["tasks"], start=1):
+            priority = task.get("priority") or "Unspecified"
+            lines.append(f'{position}. {task["title"]} [{priority}]')
+
+        nav = []
+        if index > 0:
+            nav.append(f'`back` for {self._format_due_date(groups[index - 1]["due_date"])}')
+        if index < len(groups) - 1:
+            nav.append(f'`next` for {self._format_due_date(groups[index + 1]["due_date"])}')
+
+        lines.extend(
+            [
+                "",
+                "Reply with a task number to inspect it.",
+            ]
+        )
+        if nav:
+            lines.append("Navigation: " + ", ".join(nav))
+        lines.append("Reply `cancel` to stop task selection.")
+        return "\n".join(lines)
+
+    def _format_due_date(self, due_value: str) -> str:
+        due = parse_iso_date(due_value)
+        if due is None:
+            return due_value or "Unspecified"
+        return due.strftime("%d/%m/%Y")
 
     def _handle_init_message(
         self,
