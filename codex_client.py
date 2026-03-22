@@ -181,7 +181,7 @@ class CodexClient:
         if re.search(r"(?<!\S)-C\s+(?:\"[^\"]*\"|'[^']*'|\S+)", command):
             return re.sub(
                 r"(?<!\S)-C\s+(?:\"[^\"]*\"|'[^']*'|\S+)",
-                c_arg,
+                lambda _: c_arg,
                 command,
                 count=1,
             )

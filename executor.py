@@ -227,10 +227,31 @@ class DiscussionExecutor:
         task_memory = self.task_memory_store.load(project_name, task["id"], task)
         session = self._start_session(project_name, task)
         task_memory["workflow_state"] = "discussing"
-        self.task_memory_store.save(project_name, task["id"], task_memory)
-        self.telegram.send_message(
-            self._task_intro(task, task_memory, project_memory)
+        task_memory = self.task_memory_store.append_message(
+            project_name,
+            task["id"],
+            task_memory,
+            "user",
+            self._task_start_prompt(task_memory),
         )
+        try:
+            reply = self.codex.discuss(task, project_memory, task_memory)
+        except Exception as exc:
+            task_memory["workflow_state"] = "discussion_failed"
+            self.task_memory_store.save(project_name, task["id"], task_memory)
+            self.telegram.send_message(
+                f'Started task "{task["title"]}", but the initial discussion failed: {exc}'
+            )
+            return task, task_memory, session
+
+        task_memory = self.task_memory_store.append_message(
+            project_name,
+            task["id"],
+            task_memory,
+            "assistant",
+            reply,
+        )
+        self.telegram.send_message(reply)
         return task, task_memory, session
 
     def _implement(
@@ -504,32 +525,22 @@ class DiscussionExecutor:
             """
         ).strip()
 
-    def _task_intro(self, task: dict, task_memory: dict, project_memory: dict) -> str:
-        previous_summary = task_memory.get("planning_summary") or "None"
+    def _task_start_prompt(self, task_memory: dict) -> str:
+        if task_memory.get("discussion"):
+            return dedent(
+                """
+                Task selected again from /start.
+                Continue from the existing task memory.
+                Ask only the highest-value remaining clarification if one is still unresolved.
+                If no clarification is needed, give the next concrete action for this task.
+                """
+            ).strip()
         return dedent(
-            f"""
-            Active project:
-            Name: {project_memory.get("project_name") or "Not set"}
-            Repo: {project_memory.get("target_repo_path") or "Not set"}
-            Idea: {project_memory.get("project_goal") or "Not set"}
-
-            Task selected for discussion:
-            Title: {task["title"]}
-            Status: {task.get("status") or "Unspecified"}
-            Due: {task.get("due_date") or "Unspecified"}
-            Priority: {task.get("priority") or "Unspecified"}
-
-            Notes:
-            {task.get("notes") or "No notes available."}
-
-            Previous summary:
-            {previous_summary}
-
-            Reply with clarifications.
-            Use `/gen_report` to resolve open questions and generate the report.
-            Use `/implement` to create a branch and run implementation.
-            Use `/done` to finalize the report and git workflow.
-            Use `/abort` to restore task memory/report state for this session.
+            """
+            Task selected from /start.
+            Begin the discussion now.
+            Ask the smallest set of focused clarifying questions needed to proceed.
+            If nothing important is unclear, say that directly and give the next concrete action.
             """
         ).strip()
 
